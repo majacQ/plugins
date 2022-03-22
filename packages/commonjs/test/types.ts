@@ -20,7 +20,9 @@ const config: RollupOptions = {
       sourceMap: false,
       transformMixedEsModules: false,
       ignore: ['conditional-runtime-dependency'],
-      dynamicRequireTargets: ['node_modules/logform/*.js']
+      dynamicRequireTargets: ['node_modules/logform/*.js'],
+      dynamicRequireRoot: 'node_modules',
+      strictRequires: ['node_modules/foo/*.js']
     })
   ]
 };

@@ -5,5 +5,4 @@ var getFilePath = input.getFilePath = function getFilePath(someFile) {
   return require.resolve(someFile);
 };
 
-export default input;
-export { input as __moduleExports, getFilePath };
+export { input as __moduleExports, getFilePath, input as default };

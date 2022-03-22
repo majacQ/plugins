@@ -1,18 +1,16 @@
-import { dirname, resolve } from 'path';
-
-import { sync as nodeResolveSync } from 'resolve';
-
+import { COMMONJS_REQUIRE_EXPORT, CREATE_COMMONJS_REQUIRE_EXPORT } from './dynamic-modules';
 import {
+  DYNAMIC_MODULES_ID,
   EXPORTS_SUFFIX,
+  EXTERNAL_SUFFIX,
   HELPERS_ID,
+  IS_WRAPPED_COMMONJS,
+  isWrappedId,
   MODULE_SUFFIX,
-  PROXY_SUFFIX,
-  REQUIRE_SUFFIX,
   wrapId
 } from './helpers';
-import { normalizePathSlashes } from './utils';
 
-export function isRequireStatement(node, scope) {
+export function isRequireExpression(node, scope) {
   if (!node) return false;
   if (node.type !== 'CallExpression') return false;
 
@@ -22,7 +20,7 @@ export function isRequireStatement(node, scope) {
   return isRequire(node.callee, scope);
 }
 
-function isRequire(node, scope) {
+export function isRequire(node, scope) {
   return (
     (node.type === 'Identifier' && node.name === 'require' && !scope.contains('require')) ||
     (node.type === 'MemberExpression' && isModuleRequire(node, scope))
@@ -39,12 +37,7 @@ export function isModuleRequire({ object, property }, scope) {
   );
 }
 
-export function isStaticRequireStatement(node, scope) {
-  if (!isRequireStatement(node, scope)) return false;
-  return !hasDynamicArguments(node);
-}
-
-function hasDynamicArguments(node) {
+export function hasDynamicArguments(node) {
   return (
     node.arguments.length > 1 ||
     (node.arguments[0].type !== 'Literal' &&
@@ -58,89 +51,61 @@ export function isNodeRequirePropertyAccess(parent) {
   return parent && parent.property && reservedMethod[parent.property.name];
 }
 
-export function isIgnoredRequireStatement(requiredNode, ignoreRequire) {
-  return ignoreRequire(requiredNode.arguments[0].value);
-}
-
 export function getRequireStringArg(node) {
   return node.arguments[0].type === 'Literal'
     ? node.arguments[0].value
     : node.arguments[0].quasis[0].value.cooked;
 }
 
-export function hasDynamicModuleForPath(source, id, dynamicRequireModuleSet) {
-  if (!/^(?:\.{0,2}[/\\]|[A-Za-z]:[/\\])/.test(source)) {
-    try {
-      const resolvedPath = normalizePathSlashes(nodeResolveSync(source, { basedir: dirname(id) }));
-      if (dynamicRequireModuleSet.has(resolvedPath)) {
-        return true;
-      }
-    } catch (ex) {
-      // Probably a node.js internal module
-      return false;
-    }
-
-    return false;
-  }
-
-  for (const attemptExt of ['', '.js', '.json']) {
-    const resolvedPath = normalizePathSlashes(resolve(dirname(id), source + attemptExt));
-    if (dynamicRequireModuleSet.has(resolvedPath)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 export function getRequireHandlers() {
-  const requiredSources = [];
-  const requiredBySource = Object.create(null);
-  const requiredByNode = new Map();
-  const requireExpressionsWithUsedReturnValue = [];
+  const requireExpressions = [];
 
-  function addRequireStatement(sourceId, node, scope, usesReturnValue) {
-    const required = getRequired(sourceId);
-    requiredByNode.set(node, { scope, required });
-    if (usesReturnValue) {
-      required.nodesUsingRequired.push(node);
-      requireExpressionsWithUsedReturnValue.push(node);
-    }
+  function addRequireStatement(
+    sourceId,
+    node,
+    scope,
+    usesReturnValue,
+    isInsideTryBlock,
+    isInsideConditional,
+    toBeRemoved
+  ) {
+    requireExpressions.push({
+      sourceId,
+      node,
+      scope,
+      usesReturnValue,
+      isInsideTryBlock,
+      isInsideConditional,
+      toBeRemoved
+    });
   }
 
-  function getRequired(sourceId) {
-    if (!requiredBySource[sourceId]) {
-      requiredSources.push(sourceId);
-
-      requiredBySource[sourceId] = {
-        source: sourceId,
-        name: null,
-        nodesUsingRequired: []
-      };
-    }
-
-    return requiredBySource[sourceId];
-  }
-
-  function rewriteRequireExpressionsAndGetImportBlock(
+  async function rewriteRequireExpressionsAndGetImportBlock(
     magicString,
     topLevelDeclarations,
-    topLevelRequireDeclarators,
     reassignedNames,
     helpersName,
-    dynamicRegisterSources,
+    dynamicRequireName,
     moduleName,
     exportsName,
     id,
-    exportMode
+    exportMode,
+    resolveRequireSourcesAndUpdateMeta,
+    needsRequireWrapper,
+    isEsModule,
+    isDynamicRequireModulesEnabled,
+    getIgnoreTryCatchRequireStatementMode,
+    commonjsMeta
   ) {
-    setRemainingImportNamesAndRewriteRequires(
-      requireExpressionsWithUsedReturnValue,
-      requiredByNode,
-      magicString
-    );
     const imports = [];
     imports.push(`import * as ${helpersName} from "${HELPERS_ID}";`);
+    if (dynamicRequireName) {
+      imports.push(
+        `import { ${
+          isDynamicRequireModulesEnabled ? CREATE_COMMONJS_REQUIRE_EXPORT : COMMONJS_REQUIRE_EXPORT
+        } as ${dynamicRequireName} } from "${DYNAMIC_MODULES_ID}";`
+      );
+    }
     if (exportMode === 'module') {
       imports.push(
         `import { __module as ${moduleName}, exports as ${exportsName} } from ${JSON.stringify(
@@ -152,47 +117,102 @@ export function getRequireHandlers() {
         `import { __exports as ${exportsName} } from ${JSON.stringify(wrapId(id, EXPORTS_SUFFIX))}`
       );
     }
-    for (const source of dynamicRegisterSources) {
-      imports.push(`import ${JSON.stringify(wrapId(source, REQUIRE_SUFFIX))};`);
-    }
-    for (const source of requiredSources) {
-      if (!source.startsWith('\0')) {
-        imports.push(`import ${JSON.stringify(wrapId(source, REQUIRE_SUFFIX))};`);
-      }
-      const { name, nodesUsingRequired } = requiredBySource[source];
-      imports.push(
-        `import ${nodesUsingRequired.length ? `${name} from ` : ''}${JSON.stringify(
-          source.startsWith('\0') ? source : wrapId(source, PROXY_SUFFIX)
-        )};`
-      );
-    }
+    const requiresBySource = collectSources(requireExpressions);
+    const requireTargets = await resolveRequireSourcesAndUpdateMeta(
+      id,
+      needsRequireWrapper ? IS_WRAPPED_COMMONJS : !isEsModule,
+      commonjsMeta,
+      Object.keys(requiresBySource).map((source) => {
+        return {
+          source,
+          isConditional: requiresBySource[source].every((require) => require.isInsideConditional)
+        };
+      })
+    );
+    processRequireExpressions(
+      imports,
+      requireTargets,
+      requiresBySource,
+      getIgnoreTryCatchRequireStatementMode,
+      magicString
+    );
     return imports.length ? `${imports.join('\n')}\n\n` : '';
   }
 
   return {
     addRequireStatement,
-    requiredSources,
     rewriteRequireExpressionsAndGetImportBlock
   };
 }
 
-function setRemainingImportNamesAndRewriteRequires(
-  requireExpressionsWithUsedReturnValue,
-  requiredByNode,
+function collectSources(requireExpressions) {
+  const requiresBySource = Object.create(null);
+  for (const requireExpression of requireExpressions) {
+    const { sourceId } = requireExpression;
+    if (!requiresBySource[sourceId]) {
+      requiresBySource[sourceId] = [];
+    }
+    const requires = requiresBySource[sourceId];
+    requires.push(requireExpression);
+  }
+  return requiresBySource;
+}
+
+function processRequireExpressions(
+  imports,
+  requireTargets,
+  requiresBySource,
+  getIgnoreTryCatchRequireStatementMode,
   magicString
 ) {
-  let uid = 0;
-  for (const requireExpression of requireExpressionsWithUsedReturnValue) {
-    const { required } = requiredByNode.get(requireExpression);
-    if (!required.name) {
-      let potentialName;
-      const isUsedName = (node) => requiredByNode.get(node).scope.contains(potentialName);
-      do {
-        potentialName = `require$$${uid}`;
-        uid += 1;
-      } while (required.nodesUsingRequired.some(isUsedName));
-      required.name = potentialName;
+  const generateRequireName = getGenerateRequireName();
+  for (const { source, id: resolvedId, isCommonJS } of requireTargets) {
+    const requires = requiresBySource[source];
+    const name = generateRequireName(requires);
+    let usesRequired = false;
+    let needsImport = false;
+    for (const { node, usesReturnValue, toBeRemoved, isInsideTryBlock } of requires) {
+      const { canConvertRequire, shouldRemoveRequire } =
+        isInsideTryBlock && isWrappedId(resolvedId, EXTERNAL_SUFFIX)
+          ? getIgnoreTryCatchRequireStatementMode(source)
+          : { canConvertRequire: true, shouldRemoveRequire: false };
+      if (shouldRemoveRequire) {
+        if (usesReturnValue) {
+          magicString.overwrite(node.start, node.end, 'undefined');
+        } else {
+          magicString.remove(toBeRemoved.start, toBeRemoved.end);
+        }
+      } else if (canConvertRequire) {
+        needsImport = true;
+        if (isCommonJS === IS_WRAPPED_COMMONJS) {
+          magicString.overwrite(node.start, node.end, `${name}()`);
+        } else if (usesReturnValue) {
+          usesRequired = true;
+          magicString.overwrite(node.start, node.end, name);
+        } else {
+          magicString.remove(toBeRemoved.start, toBeRemoved.end);
+        }
+      }
     }
-    magicString.overwrite(requireExpression.start, requireExpression.end, required.name);
+    if (needsImport) {
+      if (isCommonJS === IS_WRAPPED_COMMONJS) {
+        imports.push(`import { __require as ${name} } from ${JSON.stringify(resolvedId)};`);
+      } else {
+        imports.push(`import ${usesRequired ? `${name} from ` : ''}${JSON.stringify(resolvedId)};`);
+      }
+    }
   }
+}
+
+function getGenerateRequireName() {
+  let uid = 0;
+  return (requires) => {
+    let name;
+    const hasNameConflict = ({ scope }) => scope.contains(name);
+    do {
+      name = `require$$${uid}`;
+      uid += 1;
+    } while (requires.some(hasNameConflict));
+    return name;
+  };
 }

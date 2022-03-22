@@ -1,22 +1,16 @@
-import { dirname, extname } from 'path';
+import { extname, relative, resolve, dirname } from 'path';
 
 import { createFilter } from '@rollup/pluginutils';
-import getCommonDir from 'commondir';
 
-import { peerDependencies } from '../package.json';
+import { peerDependencies, version } from '../package.json';
 
 import analyzeTopLevelStatements from './analyze-top-level-statements';
+import { getDynamicModuleRegistry, getDynamicRequireModules } from './dynamic-modules';
 
 import {
-  getDynamicPackagesEntryIntro,
-  getDynamicPackagesModule,
-  isDynamicModuleImport
-} from './dynamic-packages-manager';
-import getDynamicRequirePaths from './dynamic-require-paths';
-import {
-  DYNAMIC_JSON_PREFIX,
-  DYNAMIC_PACKAGES_ID,
-  DYNAMIC_REGISTER_SUFFIX,
+  DYNAMIC_MODULES_ID,
+  ENTRY_SUFFIX,
+  ES_IMPORT_SUFFIX,
   EXPORTS_SUFFIX,
   EXTERNAL_SUFFIX,
   getHelpersModule,
@@ -26,33 +20,37 @@ import {
   PROXY_SUFFIX,
   unwrapId
 } from './helpers';
-import { setCommonJSMetaPromise } from './is-cjs';
 import { hasCjsKeywords } from './parse';
 import {
-  getDynamicJsonProxy,
-  getDynamicRequireProxy,
-  getSpecificHelperProxy,
+  getEntryProxy,
+  getEsImportProxy,
   getStaticRequireProxy,
   getUnknownRequireProxy
 } from './proxies';
 import getResolveId from './resolve-id';
-import validateRollupVersion from './rollup-version';
+import { getRequireResolver } from './resolve-require-sources';
+import validateVersion from './rollup-version';
 import transformCommonjs from './transform-commonjs';
-import { getName, getVirtualPathForDynamicRequirePath, normalizePathSlashes } from './utils';
+import { getName, getStrictRequiresFilter, normalizePathSlashes } from './utils';
+
+const PLUGIN_NAME = 'commonjs';
 
 export default function commonjs(options = {}) {
-  const extensions = options.extensions || ['.js'];
-  const filter = createFilter(options.include, options.exclude);
   const {
     ignoreGlobal,
     ignoreDynamicRequires,
     requireReturnsDefault: requireReturnsDefaultOption,
     esmExternals
   } = options;
+  const extensions = options.extensions || ['.js'];
+  const filter = createFilter(options.include, options.exclude);
+  const { strictRequiresFilter, detectCyclesAndConditional } = getStrictRequiresFilter(options);
+
   const getRequireReturnsDefault =
     typeof requireReturnsDefaultOption === 'function'
       ? requireReturnsDefaultOption
       : () => requireReturnsDefaultOption;
+
   let esmExternalIds;
   const isEsmExternal =
     typeof esmExternals === 'function'
@@ -60,20 +58,19 @@ export default function commonjs(options = {}) {
       : Array.isArray(esmExternals)
       ? ((esmExternalIds = new Set(esmExternals)), (id) => esmExternalIds.has(id))
       : () => esmExternals;
+
   const defaultIsModuleExports =
     typeof options.defaultIsModuleExports === 'boolean' ? options.defaultIsModuleExports : 'auto';
 
-  const { dynamicRequireModuleSet, dynamicRequireModuleDirPaths } = getDynamicRequirePaths(
-    options.dynamicRequireTargets
+  const dynamicRequireRoot =
+    typeof options.dynamicRequireRoot === 'string'
+      ? resolve(options.dynamicRequireRoot)
+      : process.cwd();
+  const { commonDir, dynamicRequireModules } = getDynamicRequireModules(
+    options.dynamicRequireTargets,
+    dynamicRequireRoot
   );
-  const isDynamicRequireModulesEnabled = dynamicRequireModuleSet.size > 0;
-  const commonDir = isDynamicRequireModulesEnabled
-    ? getCommonDir(null, Array.from(dynamicRequireModuleSet).concat(process.cwd()))
-    : null;
-
-  const esModulesWithDefaultExport = new Set();
-  const esModulesWithNamedExports = new Set();
-  const commonJsMetaPromises = new Map();
+  const isDynamicRequireModulesEnabled = dynamicRequireModules.size > 0;
 
   const ignoreRequire =
     typeof options.ignore === 'function'
@@ -94,7 +91,7 @@ export default function commonjs(options = {}) {
 
     return {
       canConvertRequire: mode !== 'remove' && mode !== true,
-      shouldRemoveRequireStatement: mode === 'remove'
+      shouldRemoveRequire: mode === 'remove'
     };
   };
 
@@ -102,38 +99,52 @@ export default function commonjs(options = {}) {
 
   const sourceMap = options.sourceMap !== false;
 
-  function transformAndCheckExports(code, id) {
-    if (isDynamicRequireModulesEnabled && this.getModuleInfo(id).isEntry) {
-      // eslint-disable-next-line no-param-reassign
-      code =
-        getDynamicPackagesEntryIntro(dynamicRequireModuleDirPaths, dynamicRequireModuleSet) + code;
-    }
+  // Initialized in buildStart
+  let requireResolver;
 
+  function transformAndCheckExports(code, id) {
     const { isEsModule, hasDefaultExport, hasNamedExports, ast } = analyzeTopLevelStatements(
       this.parse,
       code,
       id
     );
+
+    const commonjsMeta = this.getModuleInfo(id).meta.commonjs || {};
     if (hasDefaultExport) {
-      esModulesWithDefaultExport.add(id);
+      commonjsMeta.hasDefaultExport = true;
     }
     if (hasNamedExports) {
-      esModulesWithNamedExports.add(id);
+      commonjsMeta.hasNamedExports = true;
     }
 
     if (
-      !dynamicRequireModuleSet.has(normalizePathSlashes(id)) &&
-      (!hasCjsKeywords(code, ignoreGlobal) || (isEsModule && !options.transformMixedEsModules))
+      !dynamicRequireModules.has(normalizePathSlashes(id)) &&
+      (!(hasCjsKeywords(code, ignoreGlobal) || requireResolver.isRequiredId(id)) ||
+        (isEsModule && !options.transformMixedEsModules))
     ) {
-      return { meta: { commonjs: { isCommonJS: false } } };
+      commonjsMeta.isCommonJS = false;
+      return { meta: { commonjs: commonjsMeta } };
     }
 
-    // avoid wrapping as this is a commonjsRegister call
-    const disableWrap = isWrappedId(id, DYNAMIC_REGISTER_SUFFIX);
-    if (disableWrap) {
-      // eslint-disable-next-line no-param-reassign
-      id = unwrapId(id, DYNAMIC_REGISTER_SUFFIX);
-    }
+    const needsRequireWrapper =
+      !isEsModule &&
+      (dynamicRequireModules.has(normalizePathSlashes(id)) || strictRequiresFilter(id));
+
+    const checkDynamicRequire = (position) => {
+      if (id.indexOf(dynamicRequireRoot) !== 0) {
+        this.error(
+          {
+            code: 'DYNAMIC_REQUIRE_OUTSIDE_ROOT',
+            id,
+            dynamicRequireRoot,
+            message: `"${id}" contains dynamic require statements but it is not within the current dynamicRequireRoot "${dynamicRequireRoot}". You should set dynamicRequireRoot to "${dirname(
+              id
+            )}" or one of its parent directories.`
+          },
+          position
+        );
+      }
+    };
 
     return transformCommonjs(
       this.parse,
@@ -146,64 +157,89 @@ export default function commonjs(options = {}) {
       getIgnoreTryCatchRequireStatementMode,
       sourceMap,
       isDynamicRequireModulesEnabled,
-      dynamicRequireModuleSet,
-      disableWrap,
+      dynamicRequireModules,
       commonDir,
       ast,
-      defaultIsModuleExports
+      defaultIsModuleExports,
+      needsRequireWrapper,
+      requireResolver.resolveRequireSourcesAndUpdateMeta(this),
+      requireResolver.isRequiredId(id),
+      checkDynamicRequire,
+      commonjsMeta
     );
   }
 
   return {
-    name: 'commonjs',
+    name: PLUGIN_NAME,
 
-    buildStart() {
-      validateRollupVersion(this.meta.rollupVersion, peerDependencies.rollup);
+    version,
+
+    options(rawOptions) {
+      // We inject the resolver in the beginning so that "catch-all-resolver" like node-resolver
+      // do not prevent our plugin from resolving entry points ot proxies.
+      const plugins = Array.isArray(rawOptions.plugins)
+        ? [...rawOptions.plugins]
+        : rawOptions.plugins
+        ? [rawOptions.plugins]
+        : [];
+      plugins.unshift({
+        name: 'commonjs--resolver',
+        resolveId
+      });
+      return { ...rawOptions, plugins };
+    },
+
+    buildStart({ plugins }) {
+      validateVersion(this.meta.rollupVersion, peerDependencies.rollup, 'rollup');
+      const nodeResolve = plugins.find(({ name }) => name === 'node-resolve');
+      if (nodeResolve) {
+        validateVersion(nodeResolve.version, '^13.0.6', '@rollup/plugin-node-resolve');
+      }
       if (options.namedExports != null) {
         this.warn(
           'The namedExports option from "@rollup/plugin-commonjs" is deprecated. Named exports are now handled automatically.'
         );
       }
+      requireResolver = getRequireResolver(extensions, detectCyclesAndConditional);
     },
 
-    resolveId,
+    buildEnd() {
+      if (options.strictRequires === 'debug') {
+        const wrappedIds = requireResolver.getWrappedIds();
+        if (wrappedIds.length) {
+          this.warn({
+            code: 'WRAPPED_IDS',
+            ids: wrappedIds,
+            message: `The commonjs plugin automatically wrapped the following files:\n[\n${wrappedIds
+              .map((id) => `\t${JSON.stringify(relative(process.cwd(), id))}`)
+              .join(',\n')}\n]`
+          });
+        } else {
+          this.warn({
+            code: 'WRAPPED_IDS',
+            ids: wrappedIds,
+            message: 'The commonjs plugin did not wrap any files.'
+          });
+        }
+      }
+    },
 
     load(id) {
       if (id === HELPERS_ID) {
-        return getHelpersModule(isDynamicRequireModulesEnabled, ignoreDynamicRequires);
-      }
-
-      if (id.startsWith(HELPERS_ID)) {
-        return getSpecificHelperProxy(id);
+        return getHelpersModule();
       }
 
       if (isWrappedId(id, MODULE_SUFFIX)) {
-        const actualId = unwrapId(id, MODULE_SUFFIX);
-        let name = getName(actualId);
-        let code;
-        if (isDynamicRequireModulesEnabled) {
-          if (['modulePath', 'commonjsRequire', 'createModule'].includes(name)) {
-            name = `${name}_`;
-          }
-          code =
-            `import {commonjsRequire, createModule} from "${HELPERS_ID}";\n` +
-            `var ${name} = createModule(${JSON.stringify(
-              getVirtualPathForDynamicRequirePath(dirname(actualId), commonDir)
-            )});\n` +
-            `export {${name} as __module}`;
-        } else {
-          code = `var ${name} = {exports: {}}; export {${name} as __module}`;
-        }
+        const name = getName(unwrapId(id, MODULE_SUFFIX));
         return {
-          code,
+          code: `var ${name} = {exports: {}}; export {${name} as __module}`,
           syntheticNamedExports: '__module',
           meta: { commonjs: { isCommonJS: false } }
         };
       }
 
       if (isWrappedId(id, EXPORTS_SUFFIX)) {
-        const actualId = unwrapId(id, EXPORTS_SUFFIX);
-        const name = getName(actualId);
+        const name = getName(unwrapId(id, EXPORTS_SUFFIX));
         return {
           code: `var ${name} = {}; export {${name} as __exports}`,
           meta: { commonjs: { isCommonJS: false } }
@@ -218,69 +254,51 @@ export default function commonjs(options = {}) {
         );
       }
 
-      if (id === DYNAMIC_PACKAGES_ID) {
-        return getDynamicPackagesModule(dynamicRequireModuleDirPaths, commonDir);
+      // entry suffix is just appended to not mess up relative external resolution
+      if (id.endsWith(ENTRY_SUFFIX)) {
+        return getEntryProxy(
+          id.slice(0, -ENTRY_SUFFIX.length),
+          defaultIsModuleExports,
+          this.getModuleInfo
+        );
       }
 
-      if (id.startsWith(DYNAMIC_JSON_PREFIX)) {
-        return getDynamicJsonProxy(id, commonDir);
+      if (isWrappedId(id, ES_IMPORT_SUFFIX)) {
+        return getEsImportProxy(unwrapId(id, ES_IMPORT_SUFFIX), defaultIsModuleExports);
       }
 
-      if (isDynamicModuleImport(id, dynamicRequireModuleSet)) {
-        return `export default require(${JSON.stringify(normalizePathSlashes(id))});`;
-      }
-
-      if (isWrappedId(id, DYNAMIC_REGISTER_SUFFIX)) {
-        return getDynamicRequireProxy(
-          normalizePathSlashes(unwrapId(id, DYNAMIC_REGISTER_SUFFIX)),
-          commonDir
+      if (id === DYNAMIC_MODULES_ID) {
+        return getDynamicModuleRegistry(
+          isDynamicRequireModulesEnabled,
+          dynamicRequireModules,
+          commonDir,
+          ignoreDynamicRequires
         );
       }
 
       if (isWrappedId(id, PROXY_SUFFIX)) {
         const actualId = unwrapId(id, PROXY_SUFFIX);
-        return getStaticRequireProxy(
-          actualId,
-          getRequireReturnsDefault(actualId),
-          esModulesWithDefaultExport,
-          esModulesWithNamedExports,
-          commonJsMetaPromises
-        );
+        return getStaticRequireProxy(actualId, getRequireReturnsDefault(actualId), this.load);
       }
 
       return null;
     },
 
-    transform(code, rawId) {
-      let id = rawId;
+    shouldTransformCachedModule(...args) {
+      return requireResolver.shouldTransformCachedModule.call(this, ...args);
+    },
 
-      if (isWrappedId(id, DYNAMIC_REGISTER_SUFFIX)) {
-        id = unwrapId(id, DYNAMIC_REGISTER_SUFFIX);
-      }
-
+    transform(code, id) {
       const extName = extname(id);
-      if (
-        extName !== '.cjs' &&
-        id !== DYNAMIC_PACKAGES_ID &&
-        !id.startsWith(DYNAMIC_JSON_PREFIX) &&
-        (!filter(id) || !extensions.includes(extName))
-      ) {
+      if (extName !== '.cjs' && (!filter(id) || !extensions.includes(extName))) {
         return null;
       }
 
       try {
-        return transformAndCheckExports.call(this, code, rawId);
+        return transformAndCheckExports.call(this, code, id);
       } catch (err) {
         return this.error(err, err.loc);
       }
-    },
-
-    moduleParsed({ id, meta: { commonjs: commonjsMeta } }) {
-      if (commonjsMeta && commonjsMeta.isCommonJS != null) {
-        setCommonJSMetaPromise(commonJsMetaPromises, id, commonjsMeta);
-        return;
-      }
-      setCommonJSMetaPromise(commonJsMetaPromises, id, null);
     }
   };
 }

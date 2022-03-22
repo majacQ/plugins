@@ -1,11 +1,13 @@
 /* eslint-disable line-comment-position, no-new-func, no-undefined */
-import * as path from 'path';
 import os from 'os';
 
-import resolve from '@rollup/plugin-node-resolve';
+import * as path from 'path';
+
+import nodeResolve from '@rollup/plugin-node-resolve';
 
 import test from 'ava';
 import { getLocator } from 'locate-character';
+
 import { rollup } from 'rollup';
 import { SourceMapConsumer } from 'source-map';
 import { install } from 'source-map-support';
@@ -19,8 +21,30 @@ install();
 
 process.chdir(__dirname);
 
+const loader = (modules) => {
+  return {
+    load(id) {
+      if (Object.hasOwnProperty.call(modules, id)) {
+        return modules[id];
+      }
+      return null;
+    },
+    resolveId(id) {
+      if (Object.hasOwnProperty.call(modules, id)) {
+        return id;
+      }
+      return null;
+    }
+  };
+};
+
 test('Rollup peer dependency has correct format', (t) => {
   t.regex(peerDependencies.rollup, /^\^\d+\.\d+\.\d+(\|\|\^\d+\.\d+\.\d+)*$/);
+});
+
+test('exposes plugin version', (t) => {
+  const plugin = commonjs();
+  t.regex(plugin.version, /^\d+\.\d+\.\d+/);
 });
 
 // most of these should be moved over to function...
@@ -86,7 +110,7 @@ test('supports an object of multiple entry points', async (t) => {
       b: require.resolve('./fixtures/samples/multiple-entry-points/b.js'),
       c: require.resolve('./fixtures/samples/multiple-entry-points/c.js')
     },
-    plugins: [resolve(), commonjs()]
+    plugins: [nodeResolve(), commonjs()]
   });
 
   const { output } = await bundle.generate({
@@ -207,7 +231,7 @@ test.serial('handles symlinked node_modules with preserveSymlinks: false', (t) =
         throw new Error(`Unexpected warning: ${warning.message}`);
       },
       plugins: [
-        resolve({
+        nodeResolve({
           preserveSymlinks: false,
           preferBuiltins: false
         }),
@@ -326,8 +350,8 @@ test('typeof transforms: sinon', async (t) => {
   } = await bundle.generate({ format: 'es' });
 
   t.is(code.indexOf('typeof require'), -1, code);
-  // t.not( code.indexOf( 'typeof module' ), -1, code ); // #151 breaks this test
-  // t.not( code.indexOf( 'typeof define' ), -1, code ); // #144 breaks this test
+  t.is(code.indexOf('typeof module'), -1, code);
+  t.is(code.indexOf('typeof define'), -1, code);
 });
 
 test('deconflicts helper name', async (t) => {
@@ -395,7 +419,7 @@ test('rewrites top-level defines', async (t) => {
 test('respects options.external', async (t) => {
   const bundle = await rollup({
     input: 'fixtures/samples/external/main.js',
-    plugins: [resolve(), commonjs()],
+    plugins: [nodeResolve(), commonjs()],
     external: ['baz']
   });
 
@@ -444,20 +468,18 @@ test('does not warn even if the ES module does not export "default"', async (t) 
 });
 
 test('compiles with cache', async (t) => {
-  // specific commonjs require() to ensure same instance is used
-  // eslint-disable-next-line global-require
-  const commonjsInstance = require('../dist/index');
+  const plugin = commonjs();
 
-  const bundle = await rollup({
+  const { cache } = await rollup({
     input: 'fixtures/function/index/main.js',
-    plugins: [commonjsInstance()]
+    plugins: [plugin]
   });
 
   await t.notThrowsAsync(
     rollup({
       input: 'fixtures/function/index/main.js',
-      plugins: [commonjsInstance()],
-      cache: bundle
+      plugins: [plugin],
+      cache
     })
   );
 });
@@ -542,20 +564,10 @@ test('produces optimized code when importing esm with a known default export', a
     input: 'main.js',
     plugins: [
       commonjs({ requireReturnsDefault: true }),
-      {
-        load(id) {
-          if (id === 'main.js') {
-            return 'module.exports = require("esm.js")';
-          }
-          if (id === 'esm.js') {
-            return 'export const ignored = "ignored"; export default "default"';
-          }
-          return null;
-        },
-        resolveId(id) {
-          return id;
-        }
-      }
+      loader({
+        'main.js': 'module.exports = require("esm.js")',
+        'esm.js': 'export const ignored = "ignored"; export default "default"'
+      })
     ]
   });
   t.snapshot(await getCodeFromBundle(bundle));
@@ -566,20 +578,10 @@ test('produces optimized code when importing esm without a default export', asyn
     input: 'main.js',
     plugins: [
       commonjs(),
-      {
-        load(id) {
-          if (id === 'main.js') {
-            return 'module.exports = require("esm.js")';
-          }
-          if (id === 'esm.js') {
-            return 'export const value = "value";';
-          }
-          return null;
-        },
-        resolveId(id) {
-          return id;
-        }
-      }
+      loader({
+        'main.js': 'module.exports = require("esm.js")',
+        'esm.js': 'export const value = "value";'
+      })
     ]
   });
   t.snapshot(await getCodeFromBundle(bundle));
@@ -617,79 +619,6 @@ test('logs a warning when the deprecated namedExports option is used', async (t)
     message,
     'The namedExports option from "@rollup/plugin-commonjs" is deprecated. Named exports are now handled automatically.'
   );
-});
-
-test('imports .cjs file extension by default', async (t) => {
-  const bundle = await rollup({
-    input: 'fixtures/samples/cjs-extension/main.js',
-    plugins: [commonjs()]
-  });
-  t.snapshot(await getCodeFromBundle(bundle));
-});
-
-test('registers dynamic requires when entry is from a different loader', async (t) => {
-  const bundle = await rollup({
-    input: 'fixtures/samples/dynamic-require-different-loader/main.js',
-    plugins: [
-      {
-        load(id) {
-          if (id === path.resolve('fixtures/samples/dynamic-require-different-loader/main.js')) {
-            return 'import submodule1 from "./submodule1"; export default submodule1();';
-          }
-          return null;
-        }
-      },
-      commonjs({
-        dynamicRequireTargets: ['fixtures/samples/dynamic-require-different-loader/submodule2.js'],
-        transformMixedEsModules: true
-      })
-    ]
-  });
-
-  t.is((await executeBundle(bundle, t)).exports, 'Hello there');
-});
-
-test('transforms the es file with a `commonjsRequire` and no `require`s', async (t) => {
-  const bundle = await rollup({
-    input: 'fixtures/samples/dynamic-require-es-mixed-helpers/main.js',
-    plugins: [
-      commonjs({
-        dynamicRequireTargets: ['fixtures/samples/dynamic-require-es-mixed-helpers/submodule.js'],
-        transformMixedEsModules: true
-      })
-    ]
-  });
-
-  const code = await getCodeFromBundle(bundle);
-
-  t.is(/commonjsRequire\(["']\.\/submodule\.js/.test(code), true);
-});
-
-test('does not wrap commonjsRegister calls in createCommonjsModule', async (t) => {
-  const bundle = await rollup({
-    input: 'fixtures/samples/dynamic-require-double-wrap/main.js',
-    plugins: [
-      commonjs({
-        sourceMap: true,
-        dynamicRequireTargets: ['fixtures/samples/dynamic-require-double-wrap/submodule.js']
-      })
-    ]
-  });
-
-  const code = await getCodeFromBundle(bundle, { exports: 'named' });
-
-  t.not(/createCommonjsModule\(function/.test(code), true);
-});
-
-test('does not replace shorthand `require` property in object', async (t) => {
-  const bundle = await rollup({
-    input: 'fixtures/samples/shorthand-require/main.js',
-    plugins: [commonjs()]
-  });
-
-  const code = await getCodeFromBundle(bundle, { exports: 'named' });
-
-  t.is(/require: commonjsRequire/.test(code), true);
 });
 
 // This test uses worker threads to simulate an empty internal cache and needs at least Node 12
@@ -757,3 +686,526 @@ if (os.platform() === 'win32') {
     t.regex(code, /var foo(\$\d+)? = {}/);
   });
 }
+
+test('throws when there is a dynamic require from outside dynamicRequireRoot', async (t) => {
+  let error = null;
+  try {
+    await rollup({
+      input: 'fixtures/samples/dynamic-require-outside-root/main.js',
+      plugins: [
+        commonjs({
+          dynamicRequireRoot: 'fixtures/samples/dynamic-require-outside-root/nested',
+          dynamicRequireTargets: ['fixtures/samples/dynamic-require-outside-root/nested/target.js']
+        })
+      ]
+    });
+  } catch (err) {
+    error = err;
+  }
+
+  const cwd = process.cwd();
+  const id = path.join(cwd, 'fixtures/samples/dynamic-require-outside-root/main.js');
+  const dynamicRequireRoot = path.join(cwd, 'fixtures/samples/dynamic-require-outside-root/nested');
+  const minimalDynamicRequireRoot = path.join(cwd, 'fixtures/samples/dynamic-require-outside-root');
+  t.like(error, {
+    message: `"${id}" contains dynamic require statements but it is not within the current dynamicRequireRoot "${dynamicRequireRoot}". You should set dynamicRequireRoot to "${minimalDynamicRequireRoot}" or one of its parent directories.`,
+    pluginCode: 'DYNAMIC_REQUIRE_OUTSIDE_ROOT',
+    id,
+    dynamicRequireRoot
+  });
+});
+
+test('does not transform typeof exports for mixed modules', async (t) => {
+  const bundle = await rollup({
+    input: 'fixtures/samples/mixed-module-typeof-exports/main.js',
+    plugins: [commonjs({ transformMixedEsModules: true })]
+  });
+
+  const {
+    output: [{ code }]
+  } = await bundle.generate({ format: 'es' });
+
+  t.is(code.includes('typeof exports'), true, '"typeof exports" not found in the code');
+  t.snapshot(code);
+});
+
+test('throws when using an old node_resolve version', async (t) => {
+  let error = null;
+  try {
+    await rollup({
+      input: 'ignored',
+      plugins: [commonjs(), { name: nodeResolve().name }]
+    });
+  } catch (err) {
+    error = err;
+  }
+  t.like(error, {
+    message:
+      'Insufficient @rollup/plugin-node-resolve version: "@rollup/plugin-commonjs" requires at least @rollup/plugin-node-resolve@13.0.6.'
+  });
+});
+
+test('throws when using an inadequate node_resolve version', async (t) => {
+  let error = null;
+  try {
+    await rollup({
+      input: 'ignored',
+      plugins: [commonjs(), { name: nodeResolve().name, version: '13.0.5' }]
+    });
+  } catch (err) {
+    error = err;
+  }
+  t.like(error, {
+    message:
+      'Insufficient @rollup/plugin-node-resolve version: "@rollup/plugin-commonjs" requires at least @rollup/plugin-node-resolve@13.0.6 but found @rollup/plugin-node-resolve@13.0.5.'
+  });
+});
+
+const onwarn = (warning) => {
+  if (warning.code !== 'CIRCULAR_DEPENDENCY') {
+    throw new Error(warning.message);
+  }
+};
+
+const getTransformTracker = (trackedId) => {
+  const trackedTransforms = [];
+  const meta = {};
+  return {
+    meta,
+    trackedTransforms,
+    tracker: {
+      name: 'transform-tracker',
+      transform(code, id) {
+        trackedTransforms.push(id);
+      },
+      moduleParsed({ id, meta: { commonjs: commonjsMeta } }) {
+        if (id === trackedId) {
+          Object.assign(meta, commonjsMeta);
+        }
+      }
+    }
+  };
+};
+
+test('handles when an imported dependency of an ES module changes type', async (t) => {
+  const { meta, tracker, trackedTransforms } = getTransformTracker('dep.js');
+  const modules = {};
+  const resetModules = () => {
+    modules['main.js'] = "import {dep} from 'dep.js';export default dep;";
+    modules['dep.js'] = "export const dep = 'esm';";
+  };
+  const options = {
+    input: 'main.js',
+    plugins: [commonjs(), loader(modules), tracker],
+    onwarn
+  };
+
+  resetModules();
+  let bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['main.js', 'dep.js', 'main.js?commonjs-entry']);
+  trackedTransforms.length = 0;
+  const esCode = await getCodeFromBundle(bundle);
+  t.snapshot(esCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, ['dep.js', '\0commonjsHelpers.js', '\0dep.js?commonjs-exports']);
+  trackedTransforms.length = 0;
+  const cjsCode = await getCodeFromBundle(bundle);
+  t.snapshot(cjsCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-es-import']);
+  trackedTransforms.length = 0;
+  const wrappedCode = await getCodeFromBundle(bundle);
+  t.snapshot(wrappedCode);
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), esCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, [
+    'dep.js',
+    'main.js',
+    '\0dep.js?commonjs-es-import',
+    '\0commonjsHelpers.js',
+    '\0dep.js?commonjs-exports'
+  ]);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), wrappedCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), cjsCode);
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), esCode);
+});
+
+test('handles when a dynamically imported dependency of an ES module changes type', async (t) => {
+  const { meta, tracker, trackedTransforms } = getTransformTracker('dep.js');
+  const modules = {};
+  const resetModules = () => {
+    modules['main.js'] = "export default import('dep.js').then(({dep}) => dep);";
+    modules['dep.js'] = "export const dep = 'esm';";
+  };
+  const options = {
+    input: 'main.js',
+    plugins: [commonjs(), loader(modules), tracker],
+    onwarn
+  };
+
+  resetModules();
+  let bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual(await (await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['main.js', 'main.js?commonjs-entry', 'dep.js']);
+  trackedTransforms.length = 0;
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual(await (await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, ['dep.js', '\0commonjsHelpers.js', '\0dep.js?commonjs-exports']);
+  trackedTransforms.length = 0;
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual(await (await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-es-import']);
+  trackedTransforms.length = 0;
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual(await (await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js']);
+  trackedTransforms.length = 0;
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual(await (await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, [
+    'dep.js',
+    'main.js',
+    '\0dep.js?commonjs-es-import',
+    '\0commonjsHelpers.js',
+    '\0dep.js?commonjs-exports'
+  ]);
+  trackedTransforms.length = 0;
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual(await (await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js']);
+  trackedTransforms.length = 0;
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual(await (await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js']);
+  trackedTransforms.length = 0;
+});
+
+test('handles when a required dependency of a CJS module changes type', async (t) => {
+  const { meta, tracker, trackedTransforms } = getTransformTracker('dep.js');
+  const modules = {};
+  const resetModules = () => {
+    modules['main.js'] = "module.exports = require('dep.js').dep;";
+    modules['dep.js'] = "export const dep = 'esm';";
+  };
+  const options = {
+    input: 'main.js',
+    plugins: [commonjs(), loader(modules), tracker],
+    onwarn
+  };
+
+  resetModules();
+  let bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, [
+    'dep.js',
+    'main.js',
+    'main.js?commonjs-entry',
+    '\0commonjsHelpers.js',
+    '\0dep.js?commonjs-proxy'
+  ]);
+  trackedTransforms.length = 0;
+  const esCode = await getCodeFromBundle(bundle);
+  t.snapshot(esCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, [
+    'dep.js',
+    'main.js',
+    '\0dep.js?commonjs-proxy',
+    '\0dep.js?commonjs-exports'
+  ]);
+  trackedTransforms.length = 0;
+  const cjsCode = await getCodeFromBundle(bundle);
+  t.snapshot(cjsCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js']);
+  trackedTransforms.length = 0;
+  const wrappedCode = await getCodeFromBundle(bundle);
+  t.snapshot(wrappedCode);
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-proxy']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), esCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-exports']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), wrappedCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-proxy']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), cjsCode);
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-proxy']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), esCode);
+});
+
+test('handles when a required dependency of a mixed ES module changes type', async (t) => {
+  const { meta, tracker, trackedTransforms } = getTransformTracker('dep.js');
+  const modules = {};
+  const resetModules = () => {
+    modules['main.js'] = "export default require('dep.js').dep;";
+    modules['dep.js'] = "export const dep = 'esm';";
+  };
+  const options = {
+    input: 'main.js',
+    plugins: [commonjs({ transformMixedEsModules: true }), loader(modules), tracker],
+    onwarn
+  };
+
+  resetModules();
+  let bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, [
+    'dep.js',
+    'main.js',
+    'main.js?commonjs-entry',
+    '\0commonjsHelpers.js',
+    '\0dep.js?commonjs-proxy'
+  ]);
+  trackedTransforms.length = 0;
+  const esCode = await getCodeFromBundle(bundle);
+  t.snapshot(esCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, [
+    'dep.js',
+    'main.js',
+    '\0dep.js?commonjs-proxy',
+    '\0dep.js?commonjs-exports'
+  ]);
+  trackedTransforms.length = 0;
+  const cjsCode = await getCodeFromBundle(bundle);
+  t.snapshot(cjsCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js']);
+  trackedTransforms.length = 0;
+  const wrappedCode = await getCodeFromBundle(bundle);
+  t.snapshot(wrappedCode);
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-proxy']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), esCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs'; exports.dep += require('dep.js').dep;";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, 'withRequireFunction');
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjscjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-exports']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), wrappedCode);
+
+  modules['dep.js'] = "exports.dep = 'cjs';";
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, true);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'cjs');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-proxy']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), cjsCode);
+
+  resetModules();
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(meta.isCommonJS, false);
+  t.deepEqual((await executeBundle(bundle, t)).exports, 'esm');
+  t.deepEqual(trackedTransforms, ['dep.js', 'main.js', '\0dep.js?commonjs-proxy']);
+  trackedTransforms.length = 0;
+  t.is(await getCodeFromBundle(bundle), esCode);
+});
+
+test('handles ESM cycles when using the cache', async (t) => {
+  const modules = {};
+  const resetModules = () => {
+    modules['main.js'] = "import 'dep.js';console.log('main');";
+    modules['dep.js'] = "import 'main.js';console.log('dep');";
+  };
+  const options = {
+    input: 'main.js',
+    plugins: [commonjs(), loader(modules)],
+    onwarn
+  };
+
+  resetModules();
+  let bundle = await rollup(options);
+
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.snapshot(await getCodeFromBundle(bundle));
+});
+
+test('handles external dependencies when using the cache', async (t) => {
+  const modules = {};
+  const resetModules = () => {
+    modules['main.js'] =
+      "import first from 'first.js';import second from 'second.js';export default first + second;";
+    modules['first.js'] = "export {first as default} from 'external';";
+    modules['second.js'] = "module.exports = require('external').second;";
+  };
+  const options = {
+    input: 'main.js',
+    external: ['external'],
+    plugins: [commonjs(), loader(modules)],
+    onwarn
+  };
+
+  resetModules();
+  let bundle = await rollup(options);
+  t.is(
+    (
+      await executeBundle(bundle, t, {
+        context: {
+          require(id) {
+            if (id === 'external') {
+              return { first: 'first', second: 'second' };
+            }
+            throw new Error(`Unexpected require "${id}"`);
+          }
+        }
+      })
+    ).exports,
+    'firstsecond'
+  );
+  const code = await getCodeFromBundle(bundle);
+  t.snapshot(code);
+
+  options.cache = bundle.cache;
+  bundle = await rollup(options);
+  t.is(await getCodeFromBundle(bundle), code);
+});
+
+test('allows the config to be reused', async (t) => {
+  const config = {
+    preserveModules: true,
+    plugins: [
+      commonjs({ requireReturnsDefault: true }),
+      loader({
+        'foo.js': "console.log('foo')",
+        'bar.js': "console.log('bar')"
+      })
+    ]
+  };
+  let bundle = await rollup({ input: 'foo.js', ...config });
+  t.deepEqual(
+    bundle.cache.modules.map(({ id }) => id),
+    ['foo.js', 'foo.js?commonjs-entry']
+  );
+  bundle = await rollup({ input: 'bar.js', ...config });
+  t.deepEqual(
+    bundle.cache.modules.map(({ id }) => id),
+    ['bar.js', 'bar.js?commonjs-entry']
+  );
+});

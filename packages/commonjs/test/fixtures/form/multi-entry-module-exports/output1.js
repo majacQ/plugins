@@ -1,6 +1,5 @@
 import * as commonjsHelpers from "_commonjsHelpers.js";
-import "\u0000./input2.js?commonjs-require";
-import require$$0 from "\u0000./input2.js?commonjs-proxy";
+import require$$0 from "\u0000CWD/fixtures/form/multi-entry-module-exports/input2.js?commonjs-proxy";
 
 const t2 = require$$0;
 
